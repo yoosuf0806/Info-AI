@@ -1,0 +1,28 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-app: "Inter", "Noto Sans", "Noto Sans Sinhala", "Noto Sans Tamil",
+    system-ui, sans-serif;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  @apply bg-slate-50 text-ink-900 antialiased;
+}
+
+/* High-legibility focus states for accessibility. */
+:focus-visible {
+  outline: 2px solid theme("colors.brand.600");
+  outline-offset: 2px;
+}
+
+/* Preserve line breaks in RAG answers and procedure bodies. */
+.prose-answer {
+  white-space: pre-wrap;
+  line-height: 1.7;
+}

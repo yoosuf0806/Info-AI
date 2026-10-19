@@ -1,171 +1,209 @@
-# Info-AI.LK — System Architecture
+# InfoAI.LK — System Architecture
 
-A centralized, AI-driven platform that answers Sri Lankan citizens' questions
-about civic procedures (NIC, passports, vehicle revenue licenses, water/electricity
-connections, Grama Niladhari forms, etc.) in **Sinhala, Tamil, and English** — and
-renders the answer as a trackable, step-by-step procedure with a document checklist
-rather than a wall of text.
+InfoAI.LK is a Smart Digital Guide that helps Sri Lankan citizens navigate
+government and legal processes. Citizens ask a question in natural language
+(English, සිංහල, or தமிழ்) and get an answer composed **only** from official
+content entered by authorized officers, with source citations. If nothing
+relevant is found, the system says so and points the citizen to the Government
+Information Centre (**1919**) — it never answers from the model's own world
+knowledge and never invents fees, timelines, or legal steps.
 
-The core engine is **Retrieval-Augmented Generation (RAG)**: authoritative
-procedure content is curated by a data team, chunked and embedded into a vector
-store, retrieved by semantic similarity at query time, and handed to an LLM to
-compose a grounded, conversational answer. The LLM never invents fees or steps — it
-re-states what the retrieved, human-authored content says, with citations back to
-the source procedure.
+This document describes how the running system (see the repo root and
+`src/`) fits together. For setup and environment variables, see the
+[`README.md`](../README.md); for the database tables, see
+[`data-model.md`](./data-model.md).
+
+> **Scope note.** This is a complementary architecture reference for the Phase 1
+> system that already ships on `main`. An earlier draft of this branch proposed a
+> different schema (structured step/fee/document rows, `_en/_si/_ta` columns); it
+> was dropped in favour of documenting what is actually built.
 
 ---
 
-## 1. Design goals
+## 1. Two audiences, two trust levels
 
-| Goal | Why it drives the architecture |
+| Audience | Auth | What they do |
+| --- | --- | --- |
+| **Citizen** | none (anonymous) | Ask questions, read answers + citations, use suggested-question chips, leave 👍/👎 feedback. |
+| **Officer / admin** | Supabase Auth | Manage procedures, documents, categories, suggested questions; review feedback and content gaps. Role is **flat** — every authenticated user is an officer. |
+
+The trust split is enforced in the database with Row Level Security, not just in
+the UI: citizens (the `anon` key) can read only **published** content and insert
+a query row; officers (the `authenticated` key) manage content; the server uses
+the **service role** (which bypasses RLS) for RAG retrieval and privileged writes.
+
+---
+
+## 2. Stack
+
+| Layer | Choice |
 | --- | --- |
-| **Trustworthy answers** | Civic info must be correct. Answers are grounded in curated content + citations; the LLM is a presenter, not a source of truth. |
-| **Trilingual, Singlish-tolerant** | Citizens type in Sinhala, Tamil, English, romanized Sinhala, or a mix. Semantic (vector) retrieval + LLM interpretation handle this; keyword search alone cannot. |
-| **Low-friction UI** | Users are often stressed, rushed, on low-end phones and weak 3G/4G. Search-first homepage, SSR for fast first paint, aggressive edge caching of published guides. |
-| **Cheap to run, scales on spikes** | Traffic spikes when a mandate is announced. Serverless edge + managed Postgres scales without idle cost. |
-| **Editable without deploys** | Fees and forms change often. A CMS lets data-entry operators update content; re-embedding happens automatically on publish. |
+| Frontend / hosting | Next.js (App Router, React) + Tailwind, on Vercel |
+| Database & auth | Supabase (PostgreSQL + `pgvector`); Supabase Auth for officers |
+| Answering LLM | Google Gemini, Flash tier (`GEMINI_ANSWER_MODEL`) |
+| Embeddings | `gemini-embedding-001`, MRL-truncated + L2-normalized to **768** dims |
+| File storage | Supabase Storage — private `documents` bucket for uploaded PDFs/DOCX |
 
 ---
 
-## 2. High-level architecture
+## 3. High-level architecture
 
 ```mermaid
 flowchart TB
-    subgraph Client["Citizen's device (low-end phone / weak 3G)"]
-        UI["Next.js UI<br/>Omnibox · Timeline · Checklist · Lang toggle"]
+    subgraph Citizen["Citizen (no login)"]
+        CUI["Citizen app (/)<br/>question box · answer · citations · 👍/👎"]
+    end
+    subgraph Officer["Officer (Supabase Auth)"]
+        OUI["Admin (/admin/*)<br/>procedures · documents · categories · feedback"]
     end
 
-    subgraph Edge["Vercel (Edge + Serverless)"]
-        SSR["SSR / ISR pages<br/>(published guides, SEO)"]
-        API["Route Handlers / API<br/>/api/ask · /api/search"]
+    subgraph Vercel["Next.js on Vercel"]
+        ASK["/api/ask"]
+        FB["/api/feedback"]
+        SQ["/api/suggested-questions"]
+        ADMIN["/api/admin/* (officer-guarded)"]
+        MW["middleware.ts<br/>(guards /admin + /api/admin)"]
     end
 
-    subgraph AI["RAG pipeline"]
-        EMB["Embedding model<br/>(Gemini text-embedding-004)"]
-        LLM["Generation LLM<br/>(Gemini)"]
+    subgraph Gemini["Google Gemini"]
+        EMB["embeddings<br/>gemini-embedding-001"]
+        GEN["answering<br/>Flash, context-only prompt"]
     end
 
-    subgraph DB["Supabase (PostgreSQL)"]
-        AUTH["Auth"]
-        REL["Relational tables<br/>procedures · steps · documents · fees"]
-        VEC["pgvector<br/>knowledge_chunks + embeddings"]
+    subgraph Supabase["Supabase"]
+        PG[("Postgres + pgvector<br/>procedures · procedure_chunks<br/>queries · documents · …")]
+        ST["Storage<br/>private 'documents' bucket"]
         RLS["Row Level Security"]
     end
 
-    subgraph CMS["Admin / CMS portal"]
-        EDIT["Editors update<br/>procedures, steps, fees, docs"]
-    end
-
-    UI -->|question| API
-    UI -->|browse published| SSR
-    SSR -->|read published| REL
-    API -->|1 embed query| EMB
-    API -->|2 similarity search| VEC
-    API -->|3 context + prompt| LLM
-    LLM -->|grounded answer + citations| API
-    API -->|answer| UI
-    API -.->|log query / feedback| REL
-
-    EDIT -->|write| REL
-    REL -->|on publish: chunk + embed| EMB
-    EMB -->|store vectors| VEC
-    AUTH --- RLS
-    RLS --- REL
-    RLS --- VEC
+    CUI --> ASK
+    CUI --> FB
+    CUI --> SQ
+    OUI --> MW --> ADMIN
+    ASK -->|1 embed question| EMB
+    ASK -->|2 match_procedure_chunks<br/>published only| PG
+    ASK -->|3 generate from context| GEN
+    ASK -->|4 log anonymous query| PG
+    FB -->|attach 👍/👎| PG
+    ADMIN -->|manage content| PG
+    ADMIN -->|on publish: chunk + embed| EMB
+    ADMIN -->|upload/extract| ST
+    RLS --- PG
 ```
 
 ---
 
-## 3. Stack
+## 4. The RAG answer path (`/api/ask` → `src/lib/rag/answer.ts`)
 
-| Layer | Choice | Notes |
-| --- | --- | --- |
-| **Frontend / hosting** | **Next.js on Vercel** | SSR + ISR for published guides (fast first paint, SEO). Edge caching. App Router. |
-| **Database & auth** | **Supabase (PostgreSQL)** | Relational data + `pgvector` in one managed service. Supabase Auth for citizen accounts and operator roles. Row Level Security enforces who reads/writes what. |
-| **Vector store** | **`pgvector` inside Supabase** | No separate vector DB to operate. Similarity search via a SQL RPC (`match_knowledge`). |
-| **Embeddings** | **Gemini `text-embedding-004`** (768-dim) | Dimension is pinned in the schema (`vector(768)`); swapping models means a re-embed migration. |
-| **Generation** | **Gemini** (e.g. `gemini-2.x-flash`) | Called server-side only; the API key never reaches the browser. |
-| **CMS** | **Admin portal in the same Next.js app** | Gated by the `editor`/`admin` role. Operators edit content; no code changes for fee/form updates. |
-
-> The storefront repo (`go-website`) is unrelated. This project shares **nothing**
-> with it — different Supabase project, different domain, different data model.
-
----
-
-## 4. The RAG request path (`/api/ask`)
-
-1. **Receive** the raw query + the user's current UI locale.
-2. **Embed** the query with the embedding model → a 768-dim vector.
-3. **Retrieve** the top-K most similar `knowledge_chunks` via `match_knowledge()`
-   (cosine distance), optionally filtered by locale, with an English fallback when a
-   language has thin coverage.
-4. **Compose** a prompt: a strict system instruction ("answer only from the context;
-   if the context doesn't cover it, say so and point to the relevant department"),
-   the retrieved chunks, and the conversation history.
-5. **Generate** a conversational answer. When the query maps cleanly to one
-   procedure, the response links to that procedure's structured record so the UI can
-   render the **timeline + checklist** from relational data (not from free text).
-6. **Persist** the turn to `chat_messages` with the retrieved chunk IDs (for
-   citations and audit) and log the query to `search_queries` (for content-gap
-   analysis).
-
-### Why answers stay accurate
-- Fees, steps, and document lists are **relational rows**, authored by humans. The
-  timeline and checklist the UI renders come from those rows, not from LLM prose.
-- Every answer carries **citations** (the `knowledge_chunks` it used), traceable to
-  the source procedure and its last editor.
-- A nightly/triggered **re-embed** keeps the vector store in sync with edits, so a
-  fee change in the CMS reaches answers without a code deploy.
-
----
-
-## 5. Content lifecycle (CMS → vector store)
+1. **Embed** the citizen's question with Gemini (`src/lib/gemini/embeddings.ts`),
+   L2-normalized to 768 dims.
+2. **Retrieve** the top-`RAG_TOP_K` chunks via the `match_procedure_chunks` RPC —
+   cosine similarity over `procedure_chunks` whose parent procedure is
+   **published**, filtered by `RAG_MATCH_THRESHOLD`. Each hit carries its source
+   procedure's title, department, fees, timeline and last-verified date for
+   citations.
+3. **Verified-translation override.** If the citizen's language has an
+   officer-verified translation (`procedure_translations`) for a cited procedure,
+   that text is preferred over machine translation.
+4. **Generate** the answer with Gemini under a strict *context-only* prompt
+   (`src/lib/gemini/generate.ts`). If retrieval returned nothing above threshold,
+   the system returns the **"no information"** fallback pointing to **1919** —
+   it does not call the model to improvise.
+5. **Citations + notice.** The response (`AskResponse`) includes `citations`
+   (department + last-verified date), an `autoTranslated` flag when the answer was
+   machine-translated, and the resolved `language`.
+6. **Log** the turn anonymously to `queries` (question, language,
+   `retrieved_chunk_ids`, answer, `answered`) and return its `queryId` so the
+   citizen can later attach 👍/👎 via `/api/feedback`.
 
 ```mermaid
 sequenceDiagram
-    participant Op as Editor (CMS)
-    participant DB as Postgres (relational)
-    participant Job as Embed job
-    participant Vec as pgvector
+    participant C as Citizen
+    participant A as /api/ask
+    participant G as Gemini
+    participant DB as Supabase
 
-    Op->>DB: Edit procedure / steps / fees / documents
-    Op->>DB: Set status = published
-    DB->>DB: Write procedure_revisions (audit)
-    DB-->>Job: Mark affected chunks stale (content_hash changed)
-    Job->>Job: Re-chunk published content per locale
-    Job->>Vec: Upsert chunks + fresh embeddings
-    Note over Vec: Answers now reflect the new content
+    C->>A: question + language
+    A->>G: embed question (768-dim)
+    A->>DB: match_procedure_chunks(embedding, top_k, threshold)
+    alt chunks ≥ threshold
+        A->>DB: prefer verified translation if present
+        A->>G: generate answer from retrieved context only
+        A-->>C: answer + citations (+ auto-translated notice)
+    else nothing relevant
+        A-->>C: "no information" → Government Information Centre 1919
+    end
+    A->>DB: insert queries row (anonymous) → queryId
+    C->>DB: /api/feedback attaches 👍/👎 to queryId
 ```
 
-Re-embedding is triggered by content changes (detected via `content_hash`) and can
-run as a Supabase Edge Function / scheduled job. Only **published** content is
-embedded, so drafts never leak into citizen answers.
+---
+
+## 5. Content lifecycle (officer → vector store)
+
+Officers author a procedure as free-text `body` in its `authoring_language`, with
+free-text `fees` and `timeline` and a `last_verified_date`. Publishing triggers
+chunk + embed:
+
+```mermaid
+sequenceDiagram
+    participant O as Officer (/admin)
+    participant API as /api/admin/procedures
+    participant Idx as rag/index-procedure.ts
+    participant G as Gemini
+    participant DB as Supabase
+
+    O->>API: create / edit procedure (draft)
+    O->>API: set status = published
+    API->>Idx: chunk body (rag/chunk.ts)
+    Idx->>G: embed each chunk
+    Idx->>DB: replace procedure_chunks for this procedure
+    Note over DB: only published procedures are retrievable
+```
+
+Seeded procedures (migration `0004_seed.sql`) are inserted directly and have **no
+embeddings** until an officer runs `POST /api/admin/reindex` or re-saves them.
+
+Uploaded official documents (PDF/DOCX) go through text extraction
+(`src/lib/documents/extract.ts`) into the private `documents` Storage bucket
+(`src/lib/documents/storage.ts`), versioned in `documents` / `document_versions`;
+citizens never read the DMS directly.
 
 ---
 
-## 6. Trust, roles & safety
+## 6. Module map
 
-- **Roles** (`profiles.role`): `citizen` (default), `editor`, `admin`. The
-  admin/editor split and all write access are enforced in the database via **RLS**,
-  not just hidden in the UI.
-- **Anonymous use is first-class.** A citizen can ask and get a full answer without
-  an account; sign-in only adds saved guides and cross-device step progress.
-- **Published vs draft.** Anonymous/citizen reads see only `published` procedures;
-  drafts and in-review content are visible to editors/admins only.
-- **Secrets stay server-side.** Embedding/LLM keys live in server env vars and are
-  used only from Route Handlers / Edge Functions.
+| Path | Responsibility |
+| --- | --- |
+| `src/app/page.tsx`, `src/components/citizen/CitizenApp.tsx` | Citizen app (omnibox, answer panel, chips, feedback) |
+| `src/app/admin/**` | Officer portal pages |
+| `src/app/api/ask/route.ts` | Citizen Q&A endpoint |
+| `src/app/api/feedback/route.ts` | Attach 👍/👎 to a logged query |
+| `src/app/api/suggested-questions/route.ts` | Public chips |
+| `src/app/api/admin/**` | Officer-guarded content/document/category/query APIs + `reindex` |
+| `src/middleware.ts` | Guards `/admin` and `/api/admin` behind an officer session |
+| `src/lib/rag/{answer,chunk,index-procedure}.ts` | RAG: answer, chunking, publish-time embedding |
+| `src/lib/gemini/{client,embeddings,generate}.ts` | Gemini client, embeddings, strict answering prompt |
+| `src/lib/supabase/{client,server,admin,auth}.ts` | Browser / server / service-role clients + auth helpers |
+| `src/lib/documents/{extract,storage}.ts` | Document text extraction + Storage access |
+| `src/i18n/dictionaries.ts` | UI strings for EN / සිංහල / தமிழ් |
+| `supabase/migrations/*` | Schema, RLS, `match_procedure_chunks`, seed, Storage bucket |
 
 ---
 
-## 7. What ships first
+## 7. Guardrails (non-negotiable)
 
-The initial foundation (this change) is the **architecture** and the **data model**:
+- Citizen answers come from retrieved government content **only** — never the
+  model's own knowledge; no invented fees, timelines, or legal steps.
+- Every answer cites its source and last-verified date.
+- Only **published** procedures are retrievable (enforced by RLS *and* the RAG SQL
+  function).
+- Auto-translated legal content carries the translated notice unless a verified
+  translation exists.
+- Secrets (Gemini key, Supabase service-role key) stay server-side; only
+  `NEXT_PUBLIC_*` reaches the browser.
 
-- `docs/architecture.md` — this document
-- `docs/data-model.md` — table-by-table reference + ERD
-- `supabase/migrations/0001_init.sql` — the schema: enums, catalog tables,
-  procedures/steps/documents/fees, `pgvector` knowledge store + `match_knowledge()`,
-  user engagement tables, analytics/audit, RLS policies, and seed reference rows.
+## 8. Phase 2 (deferred, designed for)
 
-Next up (not in this change): the Next.js app shell, the `/api/ask` RAG handler,
-the embed job, and the CMS screens.
+Interactive document checklist, "find nearest office" Maps links, printable
+one-page summaries, and an analytics dashboard.

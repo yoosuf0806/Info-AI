@@ -1,37 +1,62 @@
-# Info-AI.LK — AI assistant for Sri Lankan civic procedures
+# InfoAI.LK — AI assistant for Sri Lankan government & legal processes
 
-A centralized, trilingual (Sinhala / Tamil / English) platform that answers
-citizens' questions about government procedures — NIC, passport, vehicle licensing,
-water/electricity connections, Grama Niladhari forms — and renders each answer as a
-trackable **step timeline** with a **document checklist**, not a wall of text.
+Citizens ask questions in natural language (English / සිංහල / தமிழ්) and get
+answers composed **only** from official content entered by authorized officers,
+with source citations. It is a strict **RAG** system — Gemini answers only from
+retrieved database content, never from its own world knowledge. When nothing
+relevant is found, it says so and points to the Government Information Centre
+(**1919**).
 
-## Architecture (see `docs/architecture.md`)
+See [`README.md`](./README.md) for setup, [`docs/architecture.md`](./docs/architecture.md)
+for how the system fits together, and [`docs/data-model.md`](./docs/data-model.md)
+for the database.
 
-- **Frontend / hosting:** Next.js on Vercel (SSR + ISR, edge-cached public guides).
-- **Database & auth:** Supabase (PostgreSQL) with `pgvector` for embeddings, RLS for roles.
-- **RAG:** query → embed (Gemini `text-embedding-004`, 768-dim) → `match_knowledge()`
-  similarity search → Gemini generation, grounded strictly in retrieved content + citations.
-- **CMS:** admin portal in the same app; editors update fees/forms without code changes;
-  publishing re-embeds the affected content.
+## Stack
 
-## Core principle: the LLM presents, it does not invent
+- **Frontend / hosting:** Next.js (App Router) + Tailwind, on Vercel.
+- **DB & auth:** Supabase (Postgres + `pgvector`); Supabase Auth for officers.
+- **LLM:** Google Gemini — Flash tier for answering; `gemini-embedding-001`
+  embeddings, L2-normalized to **768** dims.
+- **Files:** Supabase Storage, private `documents` bucket.
 
-Fees, steps and required documents are **relational rows** authored by humans
-(`procedures`, `procedure_steps`, `required_documents`, `fees`). The UI renders the
-timeline and checklist from those rows. The LLM only re-states retrieved content and
-always cites the source procedure. Never move authority for fees/steps into free text
-or the browser.
+## Core principle: answer only from retrieved government content
 
-## Data model (see `docs/data-model.md`, schema in `supabase/migrations/0001_init.sql`)
+`/api/ask` (`src/lib/rag/answer.ts`): embed the question → `match_procedure_chunks`
+over **published** procedures only → generate under a strict context-only prompt →
+return citations (department + last-verified date). No retrieval above
+`RAG_MATCH_THRESHOLD` ⇒ the "no information / 1919" fallback; the model is **not**
+asked to improvise. Never invent fees, timelines, or legal steps, and never move
+answering to the model's own knowledge or to the browser.
 
-- Trilingual authored text uses `_en` / `_si` / `_ta` columns; English is required,
-  si/ta fall back to English.
-- Money is integer `amount_cents` (LKR) — never floats.
-- Only `published` procedures are readable by anonymous/citizen roles (RLS).
-- `is_staff()` / `is_admin()` (security-definer) gate all catalog writes.
-- Numbered SQL migrations in `supabase/migrations/`; apply with `supabase db push`.
+## Things worth knowing before changing them
 
-## Not in this repo
+- **Trilingual by translation, not columns.** A procedure has one `body` in its
+  `authoring_language`; other languages are machine-translated at answer time
+  unless an officer-verified `procedure_translations` row exists (which wins).
+  Machine-translated answers carry the `autoTranslated` notice.
+- **Fees and timeline are free text** on `procedures`, not structured rows.
+- **Only published procedures are retrievable** — enforced by RLS *and* inside
+  `match_procedure_chunks`. Don't weaken either.
+- **Embedding dimension is pinned to 768.** It must match in `vector(768)`
+  (`0001_init.sql`) and `GEMINI_EMBEDDING_DIM`; changing it means re-embedding all
+  published procedures.
+- **Publishing re-embeds.** `src/lib/rag/index-procedure.ts` chunks + embeds on
+  publish. Seeded procedures (`0004_seed.sql`) have no embeddings until
+  `POST /api/admin/reindex` or a re-save.
+- **Trust split is in the DB.** Citizens are `anon` (read published, insert a
+  query, attach feedback); officers are `authenticated` (manage content); the
+  server uses the service role (bypasses RLS) for retrieval and privileged writes.
+  Roles are flat — every authenticated user is an officer. `/admin` and
+  `/api/admin` are guarded by `src/middleware.ts`.
+- **Secrets stay server-side.** Only `NEXT_PUBLIC_*` reaches the browser.
 
-This is unrelated to `go-website` (the Golden Oven storefront). Different Supabase
-project, domain, and data model — share nothing between them.
+## Migrations
+
+Numbered SQL in `supabase/migrations/`, applied in order `0001`→`0005`
+(`supabase db push`). `0001` tables, `0002` RLS, `0003` `match_procedure_chunks`,
+`0004` seed, `0005` Storage bucket.
+
+## Not this repo
+
+Unrelated to `go-website` (the Golden Oven storefront) — different Supabase
+project, domain, and data model.

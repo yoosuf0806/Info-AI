@@ -1,134 +1,112 @@
-# Info-AI.LK — Data Model
+# InfoAI.LK — Data Model
 
-The schema lives in `supabase/migrations/0001_init.sql`. This document explains
-each table and the decisions behind it. Four groups:
-
-1. **Catalog** — the authored, trilingual civic content (procedures, steps, docs, fees)
-2. **Knowledge** — the `pgvector` RAG store derived from published catalog content
-3. **Engagement** — citizen accounts, bookmarks, step progress, chat
-4. **Analytics / audit** — query logs and an append-only edit history
+The schema lives in `supabase/migrations/` and is applied in order:
+`0001_init.sql` (tables + indexes), `0002_rls.sql` (Row Level Security),
+`0003_functions.sql` (`match_procedure_chunks`), `0004_seed.sql` (categories +
+flagship NIC content), `0005_storage.sql` (the `documents` Storage bucket). This
+document is the table-by-table reference and ERD; the TypeScript row shapes are in
+`src/lib/types.ts`.
 
 ## Entity-relationship diagram
 
 ```mermaid
 erDiagram
-    profiles ||--o{ procedures : "authors"
     categories ||--o{ procedures : "groups"
-    institutions ||--o{ procedures : "owns"
-    institutions ||--o{ procedure_steps : "hosts step"
-
-    procedures ||--o{ procedure_steps : "has"
-    procedures ||--o{ required_documents : "needs"
-    procedures ||--o{ fees : "costs"
-    procedures ||--o{ procedure_revisions : "audited by"
-    procedures ||--o{ knowledge_chunks : "embedded as"
-    procedure_steps ||--o{ required_documents : "at step"
-    procedure_steps ||--o{ fees : "at step"
-
-    profiles ||--o{ saved_procedures : "bookmarks"
-    procedures ||--o{ saved_procedures : ""
-    profiles ||--o{ user_step_progress : "tracks"
-    procedure_steps ||--o{ user_step_progress : ""
-
-    profiles ||--o{ chat_sessions : "owns"
-    chat_sessions ||--o{ chat_messages : "contains"
-    chat_messages ||--o{ message_feedback : "rated by"
-    chat_messages }o--o{ knowledge_chunks : "cites"
-
-    profiles ||--o{ search_queries : "asks"
-    procedures ||--o{ search_queries : "matched"
+    categories ||--o{ documents : "groups"
+    categories ||--o{ suggested_questions : "chips for"
+    procedures ||--o{ procedure_translations : "verified translations"
+    procedures ||--o{ procedure_chunks : "embedded as"
+    procedures ||--o{ documents : "attached files"
+    documents  ||--o{ document_versions : "history"
+    auth_users ||--|| officer_profiles : "officer profile"
 ```
 
-## Cross-cutting conventions
+`queries` has no foreign keys — it stores anonymous analytics and references
+chunk ids only as a plain `uuid[]` (`retrieved_chunk_ids`).
 
-- **UUID keys** via `gen_random_uuid()` (pgcrypto).
-- **Trilingual columns** `_en` / `_si` / `_ta`. English is `not null`; Sinhala and
-  Tamil are nullable and the app falls back to English when a translation is missing.
-  Explicit columns (over a JSONB blob) keep the CMS forms and queries simple and let
-  us index/validate each language independently. Languages are fixed at three.
-- **Money** is integer `amount_cents` in LKR — never floats.
-- **`updated_at`** is maintained by the `set_updated_at()` trigger on every mutable table.
+## Conventions
+
+- **UUID** primary keys via `gen_random_uuid()` (pgcrypto).
+- **`updated_at`** maintained by the `set_updated_at()` trigger on mutable tables.
+- **Enums:** `language_code` (`en`/`si`/`ta`), `procedure_status`
+  (`draft`/`published`), `feedback_value` (`up`/`down`).
+- **Trilingual by translation, not columns.** A procedure stores one `body` in its
+  `authoring_language`; other languages are served by machine translation at answer
+  time, overridden by an officer-verified row in `procedure_translations` when one
+  exists.
+- **Fees/timeline are free text** on `procedures` (e.g. `"Rs. 500. One Day
+  Service: + Rs. 500"`, `"3–4 weeks"`), not structured money/step rows.
 
 ---
 
-## 1. Catalog
+## Tables
+
+### Catalog & content
 
 | Table | Purpose |
 | --- | --- |
-| `categories` | Homepage groupings and quick links (National ID, Vehicles, Utilities…). |
-| `institutions` | Government offices (Police, Grama Niladhari, Divisional Secretariat, DRP, DMT…) referenced by procedures and steps. `contact` JSONB holds hotline/address. |
-| `procedures` | One civic procedure (e.g. *Replace lost NIC*). Slug, category, owning institution, `status`, trilingual title/summary/overview/duration, `keywords[]` for Singlish & synonyms, version + publish timestamp, author/editor. |
-| `procedure_steps` | Ordered steps rendered as the **interactive timeline**. `step_number` is unique per procedure; `institution_id` is where the step happens; `online_url` set when a step can be done online. |
-| `required_documents` | The **document checklist**. Linked to a procedure and optionally to the step where the document is needed. Tracks original-vs-copy and `copies_required`. |
-| `fees` | Fee **line items** (standard / penalty / express / optional) with `effective_from` dates, so a fee change is an update with history, not an overwrite. |
-| `procedure_revisions` | Append-only JSON snapshots of each published version for audit ("who changed the fee, when"). |
+| `categories` | Top-level groupings (name, `slug`, `display_order`, `is_archived`). |
+| `procedures` | A government procedure: `title`, free-text `body`, `source_department`, free-text `fees` and `timeline`, `authoring_language`, `last_verified_date`, `status` (draft/published), `created_by`. Indexed on `category_id` and `status`. |
+| `procedure_translations` | Officer-**verified** translations of a procedure's body, one per `(procedure_id, language)`. Preferred over machine translation. |
+| `suggested_questions` | Curated citizen prompt chips per category (`question_text`, `display_order`, `is_active`). |
 
-**Why steps, documents and fees are relational (not LLM text):** the UI renders the
-timeline and checklist directly from these rows, and the figures are authoritative.
-The LLM only *presents* them — it never originates a fee or a step.
+### RAG
 
----
-
-## 2. Knowledge (RAG / pgvector)
-
-| Table / function | Purpose |
+| Object | Purpose |
 | --- | --- |
-| `knowledge_chunks` | Published content chunked per `locale`, with `embedding vector(768)` and a `content_hash` so the embed job re-embeds only what changed. An `ivfflat` cosine index serves similarity search. |
-| `match_knowledge(query_embedding, match_count, filter_locale, min_similarity)` | SQL RPC called by `/api/ask`. Returns the closest chunks (optionally per-locale) with a `similarity` score and the source `procedure_id` for citations. |
+| `procedure_chunks` | The vector store: `chunk_index`, `chunk_text`, `embedding vector(768)`, unique per `(procedure_id, chunk_index)`. `ivfflat` cosine index `idx_chunks_embedding`. Rebuilt on publish from the procedure body. |
+| `match_procedure_chunks(query_embedding, match_count, match_threshold)` | `0003_functions.sql`. Cosine-similarity search joined to **published** procedures; returns `similarity = 1 - cosine_distance` plus each chunk's procedure title, department, fees, timeline, language, last-verified date and category for citations. |
 
-Dimension `768` is pinned to Gemini `text-embedding-004`. Switching embedding models
-means a re-embed migration (drop/rebuild the vectors + index). Only **published**
-content is embedded, so drafts never surface in citizen answers. The embed job runs
-with the Supabase **service role** (bypasses RLS); the anon/auth API cannot write chunks.
+> **Embedding dimension (768)** must match `GEMINI_EMBEDDING_DIM`. Changing it
+> means editing `vector(768)` in `0001_init.sql`, the env var, and re-embedding all
+> published procedures.
 
----
-
-## 3. Engagement
+### Document management (officer-only DMS)
 
 | Table | Purpose |
 | --- | --- |
-| `saved_procedures` | Bookmarks; composite PK `(user_id, procedure_id)`. |
-| `user_step_progress` | Per-step checklist state synced across devices; unique per `(user_id, step_id)`. |
-| `chat_sessions` | Conversations. `user_id` is **nullable** so anonymous use is first-class; anonymous rows are reached only via the server (service role). |
-| `chat_messages` | Turns, with `retrieved_chunk_ids[]` (citations/audit), resolved `procedure_id`, and model/token/latency telemetry. |
-| `message_feedback` | Thumbs up/down (`rating` −1/+1) + optional comment; one per user per message. |
+| `documents` | Uploaded official files: `title`, `file_path` (within the private Storage bucket), `file_type`, `version`, `is_archived`, optional `category_id`/`procedure_id`. |
+| `document_versions` | Append-only version history per document (`document_id`, `version`, `file_path`). |
 
----
+The private `documents` Storage bucket and its officer-only policies are created in
+`0005_storage.sql`; downloads are served via short-lived signed URLs. Citizens never
+read the DMS.
 
-## 4. Analytics
+### Identity & analytics
 
 | Table | Purpose |
 | --- | --- |
-| `search_queries` | Every query logged with `had_answer`. The partial index on `had_answer = false` makes **content-gap analysis** cheap — what citizens ask that the catalog doesn't yet cover drives the content roadmap. |
+| `officer_profiles` | Mirrors `auth.users` (`id`, `full_name`); an officer manages only their own row. All authenticated users are officers (flat role). |
+| `queries` | Anonymous analytics + feedback: `question_text`, `language`, `retrieved_chunk_ids uuid[]`, `answer_text`, `answered` (false = "no info" fallback), `feedback` (`up`/`down`, null until voted). Indexed on `created_at` and `feedback`. Drives the admin feedback/content-gap view. |
 
 ---
 
-## Row Level Security summary
+## Row Level Security (`0002_rls.sql`)
 
-| Who | Can read | Can write |
+| Table | `anon` (citizen) | `authenticated` (officer) |
 | --- | --- | --- |
-| **Anonymous / citizen** | `published` procedures (+ their steps/docs/fees), all categories & institutions | own profile, bookmarks, step progress, own chat & feedback |
-| **Editor / admin (`is_staff()`)** | everything, including drafts | all catalog content, revisions, chunks |
-| **Admin (`is_admin()`)** | everything | everything, plus users' roles in `profiles` |
-| **Service role** (embed job, server `/api/ask`) | bypasses RLS | writes chunks, logs queries, manages anonymous chat rows |
+| `categories` | read where `is_archived = false` | full manage |
+| `procedures` | read where `status = 'published'` | full manage |
+| `procedure_translations` | read if parent procedure published | full manage |
+| `procedure_chunks` | read if parent procedure published | full manage |
+| `suggested_questions` | read where `is_active = true` | full manage |
+| `documents`, `document_versions` | **no access** | full manage |
+| `officer_profiles` | — | own row only |
+| `queries` | insert; update (to attach feedback) | read all |
 
-`is_staff()` / `is_admin()` are `security definer` helpers so policies don't recurse
-through `profiles`. The admin/editor split is enforced in the database, not just the UI.
+The **service role** bypasses RLS and is used server-side for RAG retrieval and
+privileged admin writes; these policies are the safety net for anything that runs
+under the `anon`/`authenticated` keys (e.g. the browser).
 
 ---
 
-## Running the migration
+## Applying the schema
 
 ```bash
-# with the Supabase CLI against a linked project
+# Supabase SQL Editor, or:
 supabase db push
-
-# or apply the file directly
-psql "$SUPABASE_DB_URL" -f supabase/migrations/0001_init.sql
 ```
 
-After the first bulk embed, rebuild the ANN index for a good list count:
-
-```sql
-reindex index idx_chunks_embedding;  -- or recreate with lists ≈ sqrt(rows)
-```
+Run `0001`→`0005` in order. Seeded procedures have no embeddings until an officer
+calls `POST /api/admin/reindex` or re-saves each procedure. See the
+[`README.md`](../README.md) for full setup.

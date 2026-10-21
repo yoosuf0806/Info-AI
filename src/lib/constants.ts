@@ -35,3 +35,18 @@ export const RAG_MATCH_THRESHOLD = Number(
 
 export const DOCUMENTS_BUCKET =
   process.env.SUPABASE_DOCUMENTS_BUCKET || "documents";
+
+// --- Gazette ingestion (server-side) ---------------------------------------
+// The index page the scanner reads for Gazette PDF links.
+export const GAZETTE_INDEX_URL =
+  process.env.GAZETTE_INDEX_URL || "https://documents.gov.lk/web/gazettes";
+// How many newly-discovered PDFs to ingest per scan run (keeps each run bounded).
+export const GAZETTE_MAX_PER_SCAN = Number(
+  process.env.GAZETTE_MAX_PER_SCAN || 5,
+);
+// Max characters of extracted PDF text sent to the model per document.
+export const GAZETTE_MAX_CHARS = Number(
+  process.env.GAZETTE_MAX_CHARS || 18000,
+);
+// Shared secret so a scheduled cron can call the scan route without a session.
+export const CRON_SECRET = process.env.CRON_SECRET || "";

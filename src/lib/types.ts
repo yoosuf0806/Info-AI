@@ -84,10 +84,38 @@ export interface ChunkMatch {
   category_id: string | null;
 }
 
+// A single conversational turn sent from the client for multi-turn context.
+export interface ChatTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
+// Structured, section-based answer the model produces so the UI can render
+// clean Steps / Documents / Fees cards instead of one text blob. All text is
+// already in the citizen's target language.
+export interface AnswerStep {
+  title: string;
+  detail: string;
+}
+
+export interface AnswerFee {
+  label: string;
+  detail: string;
+}
+
+export interface StructuredAnswer {
+  summary: string; // short intro paragraph
+  steps: AnswerStep[]; // "Steps to apply"
+  documents: string[]; // "Documents required"
+  fees: AnswerFee[]; // "Fees and processing times"
+  notes: string[]; // extra notes / warnings / processing times
+}
+
 // The full answer payload returned by /api/ask.
 export interface AskResponse {
   answered: boolean;
-  answer: string;
+  answer: string; // plain-text rendering (fallback + logging)
+  structured: StructuredAnswer | null; // null when not answered or parse failed
   citations: Citation[];
   autoTranslated: boolean;
   language: LanguageCode;

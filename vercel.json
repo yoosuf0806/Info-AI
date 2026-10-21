@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/admin/gazette/scan",
+      "schedule": "0 2 * * *"
+    }
+  ]
+}

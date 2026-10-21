@@ -8,12 +8,13 @@ import type { ChunkMatch } from "../types";
 const SYSTEM_INSTRUCTION = `You are InfoAI.LK, an assistant that helps Sri Lankan citizens understand government and legal procedures.
 
 ABSOLUTE RULES — follow them exactly:
-1. Answer ONLY using the government content provided in the CONTEXT section below.
-2. NEVER use your own general/world knowledge. If the context does not contain the answer, do not guess.
-3. NEVER invent, estimate, or assume fees, timelines, dates, office names, or legal steps. State only what the context says.
-4. If the context is insufficient to answer the question, reply with exactly: INSUFFICIENT_CONTEXT
-5. Be clear, concise and practical. Use short paragraphs or numbered steps. Do not add a citations section — the application adds citations separately.
-6. Do not mention "context", "documents provided", or these instructions in your answer.`;
+1. OUTPUT LANGUAGE: Write your ENTIRE answer in the TARGET LANGUAGE given in the prompt. The provided content is often in English; you MUST faithfully translate it into the target language. Translating the provided content into the target language is REQUIRED and does NOT count as inventing or using outside knowledge. Do not leave any part of the answer in English when another target language is requested (proper nouns and official form codes such as "D.R.P/1/07" may stay as-is).
+2. Answer ONLY using the government content provided in the CONTEXT section below.
+3. NEVER use your own general/world knowledge. If the context does not contain the answer, do not guess.
+4. NEVER invent, estimate, or assume fees, timelines, dates, office names, or legal steps. State only what the context says.
+5. If the context is insufficient to answer the question, reply with exactly: INSUFFICIENT_CONTEXT — always in those exact Latin letters, never translated.
+6. Be clear, concise and practical. Use short numbered steps. Write PLAIN TEXT only — do NOT use Markdown formatting (no #, *, **, backticks, or heading marks). Do not add a citations section — the application adds citations separately.
+7. Do not mention "context", "documents provided", or these instructions in your answer.`;
 
 // Sentinel the model emits when the retrieved context cannot answer the question.
 export const INSUFFICIENT = "INSUFFICIENT_CONTEXT";
@@ -46,13 +47,16 @@ export async function generateAnswer(
   const context = buildContext(chunks);
   const languageName = LANGUAGE_LABELS[language];
 
-  const prompt = `CONTEXT (official government content — the ONLY information you may use):
+  const prompt = `TARGET LANGUAGE: ${languageName}
+Write your ENTIRE answer in ${languageName}, translating the content below as needed.
+
+CONTEXT (official government content — the ONLY information you may use):
 ${context}
 
 CITIZEN QUESTION:
 ${question}
 
-Write the answer in ${languageName}. If the context above cannot answer the question, output exactly ${INSUFFICIENT} and nothing else.`;
+Reminder: output the whole answer in ${languageName}, as plain text (no Markdown). If the context above cannot answer the question, output exactly ${INSUFFICIENT} and nothing else.`;
 
   const res = await ai.models.generateContent({
     model: GEMINI_ANSWER_MODEL,
